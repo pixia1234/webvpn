@@ -4,7 +4,8 @@
 
 ## 功能
 - 登录认证（默认账号/密码 `admin`/`admin`，可用环境变量覆盖）
-- 输入 URL 后由服务端代理请求，返回内容，自动重写 HTML 内链接指向网关（便于继续跳转）
+- 输入 URL 后由服务端代理请求，返回内容；自动重写 HTML 内链接指向网关（便于继续跳转）
+- 通过 AES-128 将真实目标地址编码到 token，前端看到的是网关地址 `/proxy?token=...`
 - 可选主机允许列表（限制可访问的目标域名）
 
 ## 本地运行
@@ -16,6 +17,8 @@ export WEBVPN_PASSWORD=admin
 # 允许的目标主机，逗号分隔；留空表示不限制
 export WEBVPN_ALLOWED_HOSTS="example.com,api.example.com"
 export WEBVPN_SECRET="change-me"
+# AES 加密密钥（至少 16 字符），用于生成 URL token
+export WEBVPN_AES_KEY="my-strong-key-123"
 
 python app.py
 ```

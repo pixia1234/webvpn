@@ -1,8 +1,11 @@
 import os
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
 from flask import (
     Flask,
     Response,
@@ -23,6 +26,9 @@ allowed_hosts = [host.strip() for host in os.getenv("WEBVPN_ALLOWED_HOSTS", "").
 
 username = os.getenv("WEBVPN_USER", "admin")
 password = os.getenv("WEBVPN_PASSWORD", "admin")
+# AES key for URL tokens (AES-128). Provide 16+ chars via WEBVPN_AES_KEY.
+aes_key_raw = os.getenv("WEBVPN_AES_KEY", "dev-aes-key").encode("utf-8")
+aes_key = aes_key_raw[:16].ljust(16, b"0")
 
 def is_authenticated() -> bool:
     return session.get("user") == username
@@ -52,6 +58,36 @@ def proxy_fetch(url: str):
     return requests.get(url, headers=headers, timeout=10, allow_redirects=False)
 
 
+def pad(data: bytes, block_size: int = 16) -> bytes:
+    pad_len = block_size - (len(data) % block_size)
+    return data + bytes([pad_len]) * pad_len
+
+
+def unpad(data: bytes) -> bytes:
+    if not data:
+        return data
+    pad_len = data[-1]
+    if pad_len < 1 or pad_len > 16:
+        return data
+    return data[:-pad_len]
+
+
+def encrypt_url(url: str) -> str:
+    iv = get_random_bytes(16)
+    cipher = AES.new(aes_key, AES.MODE_CBC, iv)
+    enc = cipher.encrypt(pad(url.encode("utf-8")))
+    token = urlsafe_b64encode(iv + enc).decode("ascii")
+    return token
+
+
+def decrypt_token(token: str) -> str:
+    raw = urlsafe_b64decode(token.encode("ascii"))
+    iv, enc = raw[:16], raw[16:]
+    cipher = AES.new(aes_key, AES.MODE_CBC, iv)
+    dec = unpad(cipher.decrypt(enc))
+    return dec.decode("utf-8", errors="ignore")
+
+
 def rewrite_html(base_url: str, html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all(True):
@@ -60,7 +96,7 @@ def rewrite_html(base_url: str, html: str) -> str:
             if not val:
                 continue
             joined = urljoin(base_url, val)
-            tag[attr] = url_for("proxy", url=joined)
+            tag[attr] = url_for("proxy", token=encrypt_url(joined))
     return str(soup)
 
 
@@ -95,7 +131,16 @@ def proxy():
     if auth_redirect:
         return auth_redirect
 
-    target_url = (request.args.get("url") or request.form.get("url") or "").strip()
+    token = request.args.get("token", "").strip()
+    target_url = ""
+    if token:
+        try:
+            target_url = decrypt_token(token)
+        except Exception:
+            abort(400, description="Invalid token")
+    else:
+        target_url = (request.args.get("url") or request.form.get("url") or "").strip()
+
     if not target_url:
         return render_template("index.html", error="Please provide a URL")
 
@@ -110,8 +155,9 @@ def proxy():
     # Handle redirect by rewriting Location to go through proxy
     if 300 <= upstream.status_code < 400 and "Location" in upstream.headers:
         location = urljoin(target_url, upstream.headers["Location"])
-        proxied = url_for("proxy", url=location, _external=False)
+        proxied = url_for("proxy", token=encrypt_url(location), _external=False)
         resp = redirect(proxied, code=upstream.status_code)
+        resp.headers["X-Proxy-Target"] = target_url
         return resp
 
     content_type = upstream.headers.get("Content-Type", "")
@@ -130,6 +176,7 @@ def proxy():
             continue
         resp.headers[key] = value
     resp.headers["Content-Type"] = content_type or "application/octet-stream"
+    resp.headers["X-Proxy-Target"] = target_url
     return resp
 
 
