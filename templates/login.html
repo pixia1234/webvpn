@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel small">
+  <h1>Login</h1>
+  {% if error %}
+  <div class="error">{{ error }}</div>
+  {% endif %}
+  <form method="post" class="login-form">
+    <label for="username">Username</label>
+    <input id="username" name="username" type="text" required>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" required>
+    <button type="submit">Sign in</button>
+  </form>
+</section>
+{% endblock %}

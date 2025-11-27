@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel">
+  <h1>Fetch Result</h1>
+  <div class="meta">
+    <div><strong>URL:</strong> {{ url }}</div>
+    <div><strong>Status:</strong> {{ status }}</div>
+  </div>
+  <div class="headers">
+    <h2>Response Headers</h2>
+    <pre>{% for key, value in headers.items() %}{{ key }}: {{ value }}\n{% endfor %}</pre>
+  </div>
+  <div class="content-block">
+    <h2>Body</h2>
+    {% if is_text %}
+    <pre class="content">{{ content }}</pre>
+    {% else %}
+    <div class="hint">Binary content omitted for safety.</div>
+    {% endif %}
+  </div>
+  <div class="actions">
+    <a class="button" href="{{ url_for('index') }}">Back</a>
+  </div>
+</section>
+{% endblock %}
