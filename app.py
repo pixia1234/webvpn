@@ -1,6 +1,7 @@
 import os
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from urllib.parse import urljoin, urlparse
+import re
 
 import requests
 from bs4 import BeautifulSoup
@@ -54,6 +55,7 @@ def proxy_fetch(url: str):
     for header in ["User-Agent", "Accept", "Accept-Language"]:
         if header in request.headers:
             headers[header] = request.headers[header]
+    headers.setdefault("Accept-Encoding", "identity")
     # keep redirects visible so we can rewrite Location header
     return requests.get(url, headers=headers, timeout=10, allow_redirects=False)
 
@@ -89,6 +91,14 @@ def decrypt_token(token: str) -> str:
 
 
 def rewrite_html(base_url: str, html: str, token: str) -> str:
+    parsed = urlparse(base_url)
+    scheme = parsed.scheme or "https"
+    display_url = parsed.netloc + parsed.path
+    if parsed.params:
+        display_url += f";{parsed.params}"
+    if parsed.query:
+        display_url += f"?{parsed.query}"
+
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all(True):
         for attr in ("href", "src", "action"):
@@ -98,18 +108,18 @@ def rewrite_html(base_url: str, html: str, token: str) -> str:
             joined = urljoin(base_url, val)
             tag[attr] = url_for("proxy", token=encrypt_url(joined))
     bar = soup.new_tag("div", id="webvpn-bar")
-    form = soup.new_tag("form", action=url_for("proxy"), method="get", id="webvpn-form")
+    form = soup.new_tag("form", attrs={"action": url_for("proxy"), "method": "get", "id": "webvpn-form"})
     select = soup.new_tag("select", attrs={"name": "scheme"})
     for opt in ("https", "http"):
         option = soup.new_tag("option", value=opt)
-        if base_url.startswith(f"{opt}://"):
+        if scheme == opt:
             option.attrs["selected"] = "selected"
         option.string = f"{opt}://"
         select.append(option)
     form.append(select)
     input_url = soup.new_tag(
         "input",
-        attrs={"type": "text", "name": "url", "value": base_url, "placeholder": "target URL"},
+        attrs={"type": "text", "name": "url", "value": display_url, "placeholder": "target URL"},
     )
     submit = soup.new_tag("button", type="submit")
     submit.string = "Go"
@@ -128,6 +138,10 @@ def rewrite_html(base_url: str, html: str, token: str) -> str:
   font-size:14px;
   border-bottom:1px solid rgba(91,192,190,0.2);
   box-shadow:0 12px 25px rgba(0,0,0,0.25);
+  position:sticky;
+  top:0;
+  z-index:9999;
+  box-sizing:border-box;
 }
 #webvpn-form{
   display:flex;
@@ -168,6 +182,22 @@ def rewrite_html(base_url: str, html: str, token: str) -> str:
 """
     (soup.head or soup).append(style)
     return str(soup)
+
+
+def rewrite_css(base_url: str, css_text: str) -> str:
+    """
+    Rewrite url(...) references in CSS to go through proxy tokens.
+    """
+    pattern = re.compile(r"url\\(\\s*([\"']?)(?!data:)([^)\"']+)\\1\\s*\\)", re.IGNORECASE)
+
+    def repl(match):
+        quote = match.group(1)
+        target = match.group(2)
+        joined = urljoin(base_url, target)
+        proxied = url_for("proxy", token=encrypt_url(joined))
+        return f"url({quote}{proxied}{quote})"
+
+    return pattern.sub(repl, css_text)
 
 
 @app.route("/")
@@ -226,6 +256,11 @@ def proxy():
     if not target_url:
         return render_template("index.html", error="Please provide a URL")
 
+    if not token:
+        # Redirect to tokenized URL to avoid exposing raw target in the address bar
+        fresh_token = encrypt_url(target_url)
+        return redirect(url_for("proxy", token=fresh_token), code=302)
+
     if not host_allowed(target_url):
         abort(400, description="URL not allowed")
 
@@ -245,19 +280,24 @@ def proxy():
         return resp
 
     content_type = upstream.headers.get("Content-Type", "")
-    is_html = "html" in content_type.lower()
+    ct_lower = content_type.lower()
+    is_html = "html" in ct_lower
+    is_css = "css" in ct_lower
 
     body = upstream.content
     if is_html:
         current_token = encrypt_url(target_url)
         rewritten = rewrite_html(target_url, upstream.text, current_token)
         body = rewritten.encode(upstream.encoding or "utf-8", errors="replace")
+    elif is_css:
+        current_token = encrypt_url(target_url)
+        rewritten = rewrite_css(target_url, upstream.text)
+        body = rewritten.encode(upstream.encoding or "utf-8", errors="replace")
 
     resp = Response(body, status=upstream.status_code)
     for key, value in upstream.headers.items():
-        if key.lower() in {"content-length", "transfer-encoding", "connection"}:
-            continue
-        if key.lower() == "content-encoding" and is_html:
+        k = key.lower()
+        if k in {"content-length", "transfer-encoding", "connection", "content-encoding"}:
             continue
         resp.headers[key] = value
     resp.headers["Content-Type"] = content_type or "application/octet-stream"
