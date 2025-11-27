@@ -88,7 +88,7 @@ def decrypt_token(token: str) -> str:
     return dec.decode("utf-8", errors="ignore")
 
 
-def rewrite_html(base_url: str, html: str) -> str:
+def rewrite_html(base_url: str, html: str, token: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup.find_all(True):
         for attr in ("href", "src", "action"):
@@ -97,6 +97,76 @@ def rewrite_html(base_url: str, html: str) -> str:
                 continue
             joined = urljoin(base_url, val)
             tag[attr] = url_for("proxy", token=encrypt_url(joined))
+    bar = soup.new_tag("div", id="webvpn-bar")
+    form = soup.new_tag("form", action=url_for("proxy"), method="get", id="webvpn-form")
+    select = soup.new_tag("select", attrs={"name": "scheme"})
+    for opt in ("https", "http"):
+        option = soup.new_tag("option", value=opt)
+        if base_url.startswith(f"{opt}://"):
+            option.attrs["selected"] = "selected"
+        option.string = f"{opt}://"
+        select.append(option)
+    form.append(select)
+    input_url = soup.new_tag(
+        "input",
+        attrs={"type": "text", "name": "url", "value": base_url, "placeholder": "target URL"},
+    )
+    submit = soup.new_tag("button", type="submit")
+    submit.string = "Go"
+    form.append(input_url)
+    form.append(submit)
+    bar.append(form)
+    body = soup.body or soup
+    body.insert(0, bar)
+    style = soup.new_tag("style")
+    style.string = """
+#webvpn-bar{
+  padding:10px 14px;
+  background:linear-gradient(135deg,rgba(16,24,40,0.95),rgba(16,24,40,0.9));
+  color:#e7edf5;
+  font-family:'Space Grotesk','IBM Plex Sans','Segoe UI',sans-serif;
+  font-size:14px;
+  border-bottom:1px solid rgba(91,192,190,0.2);
+  box-shadow:0 12px 25px rgba(0,0,0,0.25);
+}
+#webvpn-form{
+  display:flex;
+  align-items:center;
+  gap:10px;
+}
+#webvpn-form select,
+#webvpn-form input,
+#webvpn-form button{
+  height:40px;
+  padding:0 12px;
+  border-radius:10px;
+  border:1px solid rgba(255,255,255,0.14);
+  background:rgba(255,255,255,0.05);
+  color:#e7edf5;
+  transition:border 0.2s ease, box-shadow 0.2s ease;
+  -webkit-appearance:none;
+  appearance:none;
+}
+#webvpn-form input{
+  flex:1;
+  min-width:260px;
+}
+#webvpn-form select:focus,
+#webvpn-form input:focus{
+  border-color:#5bc0be;
+  box-shadow:0 0 0 2px rgba(91,192,190,0.25);
+}
+#webvpn-form button{
+  background:linear-gradient(135deg,#5bc0be,#4cb4b2);
+  color:#0b132b;
+  border:none;
+  font-weight:700;
+  cursor:pointer;
+  box-shadow:0 10px 24px rgba(75,180,178,0.25);
+}
+#webvpn-form button:hover{transform:translateY(-1px);}
+"""
+    (soup.head or soup).append(style)
     return str(soup)
 
 
@@ -133,6 +203,9 @@ def proxy():
 
     token = request.args.get("token", "").strip()
     target_url = ""
+    scheme = (request.args.get("scheme") or request.form.get("scheme") or "https").strip().lower()
+    if scheme not in {"http", "https"}:
+        scheme = "https"
     if token:
         try:
             target_url = decrypt_token(token)
@@ -140,6 +213,15 @@ def proxy():
             abort(400, description="Invalid token")
     else:
         target_url = (request.args.get("url") or request.form.get("url") or "").strip()
+        if not target_url and request.args and session.get("last_target"):
+            # Fallback for forms/links that lost token: reuse last target and append current query
+            base = session["last_target"]
+            qs = request.query_string.decode("utf-8")
+            target_url = base.split("?", 1)[0]
+            if qs:
+                target_url = f"{target_url}?{qs}"
+        if target_url and "://" not in target_url:
+            target_url = f"{scheme}://{target_url}"
 
     if not target_url:
         return render_template("index.html", error="Please provide a URL")
@@ -152,6 +234,8 @@ def proxy():
     except requests.RequestException as exc:
         return render_template("index.html", error=f"Request failed: {exc}")
 
+    session["last_target"] = target_url
+
     # Handle redirect by rewriting Location to go through proxy
     if 300 <= upstream.status_code < 400 and "Location" in upstream.headers:
         location = urljoin(target_url, upstream.headers["Location"])
@@ -161,11 +245,12 @@ def proxy():
         return resp
 
     content_type = upstream.headers.get("Content-Type", "")
-    is_html = content_type.startswith("text/html")
+    is_html = "html" in content_type.lower()
 
     body = upstream.content
     if is_html:
-        rewritten = rewrite_html(target_url, upstream.text)
+        current_token = encrypt_url(target_url)
+        rewritten = rewrite_html(target_url, upstream.text, current_token)
         body = rewritten.encode(upstream.encoding or "utf-8", errors="replace")
 
     resp = Response(body, status=upstream.status_code)
