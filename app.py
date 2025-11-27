@@ -1,8 +1,18 @@
 import os
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
-from flask import Flask, abort, redirect, render_template, request, session, url_for
+from bs4 import BeautifulSoup
+from flask import (
+    Flask,
+    Response,
+    abort,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 
 
 app = Flask(__name__)
@@ -38,7 +48,20 @@ def proxy_fetch(url: str):
     for header in ["User-Agent", "Accept", "Accept-Language"]:
         if header in request.headers:
             headers[header] = request.headers[header]
-    return requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+    # keep redirects visible so we can rewrite Location header
+    return requests.get(url, headers=headers, timeout=10, allow_redirects=False)
+
+
+def rewrite_html(base_url: str, html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup.find_all(True):
+        for attr in ("href", "src", "action"):
+            val = tag.get(attr)
+            if not val:
+                continue
+            joined = urljoin(base_url, val)
+            tag[attr] = url_for("proxy", url=joined)
+    return str(soup)
 
 
 @app.route("/")
@@ -66,13 +89,13 @@ def logout():
     return redirect(url_for("login"))
 
 
-@app.route("/fetch", methods=["POST"])
-def fetch():
+@app.route("/proxy", methods=["GET", "POST"])
+def proxy():
     auth_redirect = enforce_authentication()
     if auth_redirect:
         return auth_redirect
 
-    target_url = request.form.get("url", "").strip()
+    target_url = (request.args.get("url") or request.form.get("url") or "").strip()
     if not target_url:
         return render_template("index.html", error="Please provide a URL")
 
@@ -84,17 +107,30 @@ def fetch():
     except requests.RequestException as exc:
         return render_template("index.html", error=f"Request failed: {exc}")
 
-    content_type = upstream.headers.get("Content-Type", "")
-    is_text = content_type.startswith("text/") or "json" in content_type
+    # Handle redirect by rewriting Location to go through proxy
+    if 300 <= upstream.status_code < 400 and "Location" in upstream.headers:
+        location = urljoin(target_url, upstream.headers["Location"])
+        proxied = url_for("proxy", url=location, _external=False)
+        resp = redirect(proxied, code=upstream.status_code)
+        return resp
 
-    return render_template(
-        "result.html",
-        url=target_url,
-        status=upstream.status_code,
-        headers=upstream.headers,
-        content=upstream.text if is_text else "<binary content omitted>",
-        is_text=is_text,
-    )
+    content_type = upstream.headers.get("Content-Type", "")
+    is_html = content_type.startswith("text/html")
+
+    body = upstream.content
+    if is_html:
+        rewritten = rewrite_html(target_url, upstream.text)
+        body = rewritten.encode(upstream.encoding or "utf-8", errors="replace")
+
+    resp = Response(body, status=upstream.status_code)
+    for key, value in upstream.headers.items():
+        if key.lower() in {"content-length", "transfer-encoding", "connection"}:
+            continue
+        if key.lower() == "content-encoding" and is_html:
+            continue
+        resp.headers[key] = value
+    resp.headers["Content-Type"] = content_type or "application/octet-stream"
+    return resp
 
 
 if __name__ == "__main__":

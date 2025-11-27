@@ -3,10 +3,10 @@
 <section class="panel">
   <h1>Resource Access</h1>
   <p class="hint">Enter a full URL to fetch through the gateway.</p>
-  {% if error %}
+{% if error %}
   <div class="error">{{ error }}</div>
   {% endif %}
-  <form action="{{ url_for('fetch') }}" method="post" class="fetch-form">
+  <form action="{{ url_for('proxy') }}" method="post" class="fetch-form">
     <label for="url">Target URL</label>
     <input id="url" name="url" type="url" placeholder="https://example.com" required>
     <button type="submit">Fetch</button>
